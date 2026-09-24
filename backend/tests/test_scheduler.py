@@ -88,6 +88,67 @@ def test_n18_runs_quickly():
     assert elapsed < 30.0
 
 
+def _acceptance_messages():
+    # The near-saturation acceptance instance: two dense messages with
+    # coprime short periods (joint utilisation ~0.9997) plus twelve
+    # ultra-sparse messages.
+    msgs = [
+        {"id": 1, "C": 332, "T": 997, "D": 997, "J": 0},
+        {"id": 2, "C": 667, "T": 1000, "D": 1000, "J": 0},
+    ]
+    msgs += [{"id": i, "C": 1, "T": 10**9, "D": 10**9, "J": 0}
+             for i in range(3, 15)]
+    return msgs
+
+
+def test_near_saturation_instance_decides_quickly_and_exactly():
+    msgs = _acceptance_messages()
+    start = time.time()
+    order, reports = scheduler.solve(msgs)
+    elapsed = time.time() - start
+
+    # Must finish far inside the 30 s validation window.
+    assert elapsed < 5.0, elapsed
+    assert [msgs[i]["id"] for i in order] == [
+        3, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1,
+    ]
+    assert sum(not r.schedulable for r in reports) == 1
+    assert sum(r.score_term for r in reports) == 21069
+
+    # Every response time is exact (no analytically elided tail): the miss
+    # of message 1 shows its true R = 1011, not merely the capped D + 1.
+    miss = next(r for r in reports if msgs[r.idx]["id"] == 1)
+    assert not miss.schedulable
+    assert miss.response == 1011
+    assert miss.response_exact
+    assert miss.score_term == 998
+    sched_by_id = {msgs[r.idx]["id"]: r for r in reports}
+    assert sched_by_id[2].schedulable and sched_by_id[2].response == 1000
+    assert sched_by_id[3].response == 668
+    assert sched_by_id[14].response == 1678
+    assert all(r.response_exact for r in reports)
+
+
+def test_near_saturation_adjacent_parameters_stay_fast():
+    # Neighbouring dense-message parameters must also resolve promptly and
+    # exactly; these all stay near the utilisation boundary.
+    for (c1, c2) in [(331, 667), (333, 667), (332, 666), (332, 668),
+                     (330, 670), (334, 666)]:
+        msgs = [
+            {"id": 1, "C": c1, "T": 997, "D": 997, "J": 0},
+            {"id": 2, "C": c2, "T": 1000, "D": 1000, "J": 0},
+        ]
+        msgs += [{"id": i, "C": 1, "T": 10**9, "D": 10**9, "J": 0}
+                 for i in range(3, 15)]
+        start = time.time()
+        order, reports = scheduler.solve(msgs)
+        assert time.time() - start < 5.0, (c1, c2)
+        assert len(order) == 14
+        assert all(r.response_exact for r in reports), (c1, c2)
+        assert sum(r.score_term for r in reports) > 0
+
+
+
 def test_blocking_is_max_lower_priority_transmission():
     msgs = [
         {"id": 1, "C": 1, "T": 100, "D": 100, "J": 0},

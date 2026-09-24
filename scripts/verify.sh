@@ -79,6 +79,32 @@ for row in data["messages"]:
     assert row["trace"], "trace must not be empty"
     assert row["response"] == row["trace"][-1]["r"]
 
+# Near-saturation acceptance instance: two dense coprime-period messages
+# (joint utilisation ~0.9997) plus twelve ultra-sparse messages.  It must
+# resolve far inside the 30 s validation window with the exact global
+# optimum -- order, single deadline miss and criterion sum all fixed.
+sat = {
+    "messages": [
+        {"id": 1, "C": 332, "T": 997, "D": 997, "J": 0},
+        {"id": 2, "C": 667, "T": 1000, "D": 1000, "J": 0},
+    ] + [
+        {"id": i, "C": 1, "T": 10**9, "D": 10**9, "J": 0}
+        for i in range(3, 15)
+    ]
+}
+t0 = time.time()
+r = httpx.post(f"{base}/api/solve", json=sat, timeout=30)
+elapsed = time.time() - t0
+assert r.status_code == 200, r.text
+assert elapsed < 20.0, f"near-saturation solve took {elapsed:.1f}s"
+sd = r.json()
+assert sd["order"] == [3, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1], sd["order"]
+assert sd["objective"] == {"misses": 1, "score": 21069}, sd["objective"]
+by_id = {row["id"]: row for row in sd["messages"]}
+assert by_id[1]["schedulable"] is False and by_id[1]["response"] == 1011
+assert by_id[1]["responseExact"] is True
+print(f"near-saturation OK in {elapsed:.2f}s: {sd['objective']}")
+
 # 422 field-location smoke
 bad = {"messages": [
     {"id": 1, "C": 1, "T": 4, "D": 4, "J": 0},

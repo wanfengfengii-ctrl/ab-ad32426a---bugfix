@@ -50,7 +50,6 @@ def _load_lib() -> Optional[ctypes.CDLL]:
             except OSError:
                 continue
             _i64 = ctypes.c_int64
-            _u32 = ctypes.c_uint32
             _p_i64 = ctypes.POINTER(_i64)
             _p_i32 = ctypes.POINTER(ctypes.c_int)
             lib.rta_trace.argtypes = [
@@ -59,12 +58,6 @@ def _load_lib() -> Optional[ctypes.CDLL]:
                 _p_i64, _p_i64, _p_i32, ctypes.c_int,
             ]
             lib.rta_trace.restype = ctypes.c_int
-            lib.rta_light.argtypes = [
-                _i64, _i64, _i64, _i64,
-                _p_i64, _p_i64, _p_i64, _u32,
-                _p_i32, _p_i64,
-            ]
-            lib.rta_light.restype = ctypes.c_int
             lib.solve_dp.argtypes = [
                 ctypes.c_int, _p_i64, _p_i64, _p_i64, _p_i64,
                 ctypes.POINTER(ctypes.c_int32), ctypes.POINTER(ctypes.c_int),

@@ -188,3 +188,35 @@ def test_solve_maximum_size_18_messages():
         c_by_id = {x["id"]: x["C"] for x in payload["messages"]}
         expected_blocking = max((c_by_id[i] for i in lower), default=0)
         assert row["blocking"] == expected_blocking
+
+
+def test_near_saturation_acceptance_instance_via_api():
+    import time
+
+    payload = {"messages": [
+        {"id": 1, "C": 332, "T": 997, "D": 997, "J": 0},
+        {"id": 2, "C": 667, "T": 1000, "D": 1000, "J": 0},
+    ] + [
+        {"id": i, "C": 1, "T": 10**9, "D": 10**9, "J": 0}
+        for i in range(3, 15)
+    ]}
+    start = time.time()
+    r = client.post("/api/solve", json=payload)
+    elapsed = time.time() - start
+    assert r.status_code == 200, r.text
+    assert elapsed < 5.0, elapsed
+    data = r.json()
+    assert data["order"] == [
+        3, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1,
+    ]
+    assert data["objective"] == {"misses": 1, "score": 21069}
+    by_id = {row["id"]: row for row in data["messages"]}
+    assert by_id[1]["schedulable"] is False
+    assert by_id[1]["response"] == 1011
+    assert by_id[1]["responseExact"] is True
+    assert by_id[1]["scoreTerm"] == 998
+    assert by_id[2]["response"] == 1000 and by_id[2]["schedulable"]
+    for row in data["messages"]:
+        assert row["trace"], "trace must not be empty"
+        assert row["response"] == row["trace"][-1]["r"]
+
