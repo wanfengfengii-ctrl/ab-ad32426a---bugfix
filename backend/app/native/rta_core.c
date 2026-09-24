@@ -29,6 +29,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 #include <limits.h>
 
 #define MAX_N 18
@@ -37,6 +38,35 @@
 #define LCM_CAP       1000000LL   /* dense-envelope window for DP path */
 #define LCM_CAP_TRACE 5000000LL   /* larger window for final reporting */
 #define CERT_SLACK   1e-5L        /* conservative long-double slack */
+
+/* The dense interference envelope (period-LCM window F, its jump events and
+ * the range-min segment tree) depends only on the set of dense higher-
+ * priority messages, not on the sparse tail.  A subset-DP run asks the same
+ * few envelopes thousands of times (once per sparse subset); rebuilding an
+ * O(L) window each time dominated near-saturation instances.  Envelopes are
+ * therefore built once per solve and reused through this small LRU cache. */
+#define ENV_SLOTS    64
+#define ENV_BUDGET   (1LL << 28)  /* 256 MiB cap on live envelope storage */
+
+typedef struct {
+    int valid;
+    uint32_t key;                 /* dense-set bitmask */
+    unsigned long stamp;
+    int64_t L, S, G;
+    int64_t dense_const;
+    int64_t win_min;
+    int32_t *F;                   /* NULL for a retained G <= 0 marker */
+    int32_t *ev;
+    int32_t *tree;
+    int E, P2;
+    size_t bytes;
+} env_entry;
+
+typedef struct {
+    env_entry slots[ENV_SLOTS];
+    size_t total_bytes;
+    unsigned long clock;
+} env_cache;
 
 /* ceil((p + J) / T) for non-negative p */
 static inline int64_t relq(int64_t p, int64_t J, int64_t T) {
@@ -207,53 +237,58 @@ static inline int64_t gcd64(int64_t a, int64_t b) {
     return a;
 }
 
-/* Within the level-base segment tree rooted at node, covering leaf range
- * [L0, R0), return the smallest leaf index in [ql, qr) whose value <= tgt,
- * or qr if none.  O(log^2 P2) with the tail recursion below. */
-static int segtree_first(const int32_t *tree, int P2, int node,
-                         int L0, int R0, int ql, int qr, int64_t tgt) {
-    if (R0 <= ql || L0 >= qr || tree[node] > tgt) return qr;
-    if (R0 - L0 == 1) return L0;
-    int M = L0 + (R0 - L0) / 2;
-    int res = segtree_first(tree, P2, 2 * node, L0, M, ql, qr, tgt);
-    if (res != qr) return res;
-    return segtree_first(tree, P2, 2 * node + 1, M, R0, ql, qr, tgt);
+/* ---- Dense-envelope cache --------------------------------------------- */
+
+static void env_release(env_entry *e) {
+    free(e->F);
+    free(e->ev);
+    free(e->tree);
+    memset(e, 0, sizeof(*e));
 }
 
-/* Least fixed point of f(r) = base + sum_h C_h ceil((r+J_h)/T_h).
- * Returns 1 with *out_resp = R when R <= D, 0 when no fixed point <= D,
- * -1 on internal resource limits.  lcm_cap bounds the dense envelope. */
-static int least_fixed_point(int64_t base, int64_t Di,
-                             uint32_t hset,
-                             const int64_t *J, const int64_t *C,
-                             const int64_t *T,
-                             int64_t lcm_cap,
-                             int64_t *out_resp) {
-    int nh = (int)__builtin_popcount(hset);
+static void env_cache_clear(env_cache *ec) {
+    for (int s = 0; s < ENV_SLOTS; s++) env_release(&ec->slots[s]);
+    ec->total_bytes = 0;
+}
+
+/* Build the exact interference envelope of the dense set ``key``.
+ * Returns 0 on success, -1 on allocation failure.  A saturated dense set
+ * (utilisation >= 1) is retained as a F == NULL marker carrying G <= 0. */
+static int env_build(env_entry *e, uint32_t key,
+                     const int64_t *J, const int64_t *C,
+                     const int64_t *T, int64_t lcm_cap) {
+    memset(e, 0, sizeof(*e));
+    e->valid = 1;
+    e->key = key;
+
+    int nd = (int)__builtin_popcount((unsigned)key);
     hmsg hs[MAX_N];
     int k = 0;
-    uint32_t m = hset;
-    while (m) {
-        uint32_t bit = m & (0u - m);
+    uint32_t mm = key;
+    while (mm) {
+        uint32_t bit = mm & (0u - mm);
         int h = __builtin_ctz(bit);
-        m ^= bit;
+        mm ^= bit;
         hs[k++] = (hmsg){h, T[h], C[h], J[h]};
     }
-    qsort(hs, (size_t)nh, sizeof(hmsg), by_T);
+    qsort(hs, (size_t)nd, sizeof(hmsg), by_T);
 
-    /* Greedy dense prefix by LCM window only; the positive-slack check
-     * happens after the exact envelope is built (jitter shifts breakpoints
-     * at window boundaries, so utilisation cannot be decided from the
-     * periods alone). */
-    int nd = 0;
     int64_t L = 1;
-    for (int a = 0; a < nh; a++) {
+    for (int a = 0; a < nd; a++) {
         int64_t g = gcd64(L, hs[a].T);
         int64_t nl;
-        if (__builtin_mul_overflow(L, hs[a].T / g, &nl) || nl > lcm_cap) break;
+        if (__builtin_mul_overflow(L, hs[a].T / g, &nl) || nl > lcm_cap) {
+            /* The key is the greedy-prefix result of its caller, so every
+             * member fits; tolerate a mismatch by truncating the key. */
+            nd = a;
+            key = 0;
+            for (int b = 0; b < a; b++) key |= (uint32_t)1 << hs[b].h;
+            e->key = key;
+            break;
+        }
         L = nl;
-        nd++;
     }
+    e->L = L;
 
     /* Dense periods satisfy T <= L <= lcm_cap (~5e6).  Writing each
      * jitter as J = a*T + j0 (0 <= j0 < T) extracts a large constant
@@ -285,6 +320,9 @@ static int least_fixed_point(int64_t base, int64_t Di,
 
     int64_t S = F[L] - F[0];        /* dense within-window growth per L */
     int64_t G = L - S;              /* net slack per window (> 0: U < 1) */
+    e->S = S;
+    e->G = G;
+    e->dense_const = dense_const;
     if (G <= 0) {
         /* Dense utilisation >= 1 (jitter does not change the asymptotic
          * rate): the recurrence is strictly increasing -> certain miss. */
@@ -312,41 +350,172 @@ static int least_fixed_point(int64_t base, int64_t Di,
     for (int i = 0; i < 2 * P2; i++) tree[i] = INT32_MAX;
     for (int j = 0; j < E; j++) {
         int64_t end = j + 1 < E ? (int64_t)ev[j + 1] - 1 : L;
-        tree[P2 + j] = (int32_t)((int64_t)F[ev[j]] - end); /* segment min M[j] */
+        tree[P2 + j] = (int32_t)((int64_t)F[ev[j]] - end); /* segment min */
     }
     for (int i = P2 - 1; i >= 1; i--) {
         int64_t a = tree[2 * i], b = tree[2 * i + 1];
         tree[i] = a < b ? a : b;
     }
-    int64_t win_min = tree[1];
 
-    /* Smallest q >= q0 with F[q] - q <= tgt; L+1 when none in window. */
-    #define FIRST_Q(q0, tgt, out_q) do {                                      \
-        int64_t _q0 = (q0);                                                  \
-        (out_q) = L + 1;                                                     \
-        int64_t _v0 = F[_q0] - _q0;                                         \
-        if (_v0 <= (tgt)) { (out_q) = _q0; }                                 \
-        else {                                                              \
-            int _a = 0, _b = E - 1, _j0 = 0;                                \
-            while (_a <= _b) {                                              \
-                int _m = (_a + _b) / 2;                                     \
-                if (ev[_m] <= _q0) { _j0 = _m; _a = _m + 1; }               \
-                else _b = _m - 1;                                           \
-            }                                                              \
-            int64_t _end0 = _j0 + 1 < E ? (int64_t)ev[_j0 + 1] - 1 : L;    \
-            int64_t _land = _q0 + (_v0 - (tgt));                            \
-            if (_land <= _end0) { (out_q) = _land; }                       \
-            else {                                                         \
-                int _js = segtree_first(tree, P2, 1, 0, P2,               \
-                                        _j0 + 1, E, (tgt));                \
-                if (_js < E) {                                             \
-                    int64_t _s = ev[_js];                                   \
-                    int64_t _av = F[_s] - _s;                              \
-                    (out_q) = _s + (_av > (tgt) ? _av - (tgt) : 0);        \
-                }                                                          \
-            }                                                              \
-        }                                                                  \
-    } while (0)
+    e->F = F;
+    e->ev = ev;
+    e->tree = tree;
+    e->E = E;
+    e->P2 = P2;
+    e->win_min = tree[1];
+    e->bytes = ((size_t)L + 1) * sizeof(int32_t)
+             + ((size_t)L + 2) * sizeof(int32_t)
+             + 2 * (size_t)P2 * sizeof(int32_t);
+    return 0;
+}
+
+/* Return the cached envelope for ``key``, building it on a miss.  LRU
+ * eviction keeps the live footprint under ENV_BUDGET.  NULL on failure. */
+static env_entry *env_get(env_cache *ec, uint32_t key,
+                          const int64_t *J, const int64_t *C,
+                          const int64_t *T, int64_t lcm_cap) {
+    for (int s = 0; s < ENV_SLOTS; s++) {
+        env_entry *e = &ec->slots[s];
+        if (e->valid && e->key == key) {
+            e->stamp = ++ec->clock;
+            return e;
+        }
+    }
+
+    int victim = -1;
+    unsigned long oldest = 0;
+    for (int s = 0; s < ENV_SLOTS; s++) {
+        if (!ec->slots[s].valid) { victim = s; break; }
+        if (victim < 0 || ec->slots[s].stamp < oldest) {
+            victim = s;
+            oldest = ec->slots[s].stamp;
+        }
+    }
+    env_entry *e = &ec->slots[victim];
+    if (e->valid) {
+        ec->total_bytes -= e->bytes;
+        env_release(e);
+    }
+    if (env_build(e, key, J, C, T, lcm_cap) != 0) {
+        env_release(e);
+        return NULL;
+    }
+    e->stamp = ++ec->clock;
+    ec->total_bytes += e->bytes;
+
+    while (ec->total_bytes > ENV_BUDGET) {
+        int old = -1;
+        unsigned long ost = 0;
+        for (int s = 0; s < ENV_SLOTS; s++) {
+            env_entry *g = &ec->slots[s];
+            if (!g->valid || g == e || g->bytes == 0) continue;
+            if (old < 0 || g->stamp < ost) { old = s; ost = g->stamp; }
+        }
+        if (old < 0) break;
+        ec->total_bytes -= ec->slots[old].bytes;
+        env_release(&ec->slots[old]);
+    }
+    return e;
+}
+
+/* Within the level-base segment tree rooted at node, covering leaf range
+ * [L0, R0), return the smallest leaf index in [ql, qr) whose value <= tgt,
+ * or qr if none.  O(log^2 P2) with the tail recursion below. */
+static int segtree_first(const int32_t *tree, int P2, int node,
+                         int L0, int R0, int ql, int qr, int64_t tgt) {
+    if (R0 <= ql || L0 >= qr || tree[node] > tgt) return qr;
+    if (R0 - L0 == 1) return L0;
+    int M = L0 + (R0 - L0) / 2;
+    int res = segtree_first(tree, P2, 2 * node, L0, M, ql, qr, tgt);
+    if (res != qr) return res;
+    return segtree_first(tree, P2, 2 * node + 1, M, R0, ql, qr, tgt);
+}
+
+/* Smallest q >= q0 with F[q] - q <= tgt; L+1 when none in window. */
+static inline int64_t first_q(const env_entry *e, int64_t q0, int64_t tgt) {
+    const int32_t *F = e->F, *ev = e->ev, *tree = e->tree;
+    int64_t L = e->L;
+    int E = e->E, P2 = e->P2;
+    int64_t out = L + 1;
+    int64_t v0 = F[q0] - q0;
+    if (v0 <= tgt) { out = q0; }
+    else {
+        int a = 0, b = E - 1, j0 = 0;
+        while (a <= b) {
+            int mm = (a + b) / 2;
+            if (ev[mm] <= q0) { j0 = mm; a = mm + 1; }
+            else b = mm - 1;
+        }
+        int64_t end0 = j0 + 1 < E ? (int64_t)ev[j0 + 1] - 1 : L;
+        int64_t land = q0 + (v0 - tgt);
+        if (land <= end0) { out = land; }
+        else {
+            int js = segtree_first(tree, P2, 1, 0, P2, j0 + 1, E, tgt);
+            if (js < E) {
+                int64_t s = ev[js];
+                int64_t av = F[s] - s;
+                out = s + (av > tgt ? av - tgt : 0);
+            }
+        }
+    }
+    return out;
+}
+
+/* Least fixed point of f(r) = base + sum_h C_h ceil((r+J_h)/T_h).
+ * Returns 1 with *out_resp = R when R <= D, 0 when no fixed point <= D,
+ * -1 on internal resource limits.  lcm_cap bounds the dense envelope. */
+static int least_fixed_point(int64_t base, int64_t Di,
+                             uint32_t hset,
+                             const int64_t *J, const int64_t *C,
+                             const int64_t *T,
+                             int64_t lcm_cap, env_cache *ec,
+                             int64_t *out_resp) {
+    int nh = (int)__builtin_popcount((unsigned)hset);
+    hmsg hs[MAX_N];
+    int k = 0;
+    uint32_t m = hset;
+    while (m) {
+        uint32_t bit = m & (0u - m);
+        int h = __builtin_ctz(bit);
+        m ^= bit;
+        hs[k++] = (hmsg){h, T[h], C[h], J[h]};
+    }
+    qsort(hs, (size_t)nh, sizeof(hmsg), by_T);
+
+    /* Greedy dense prefix by LCM window only; the positive-slack check
+     * happens after the exact envelope is built (jitter shifts breakpoints
+     * at window boundaries, so utilisation cannot be decided from the
+     * periods alone). */
+    int nd = 0;
+    int64_t L = 1;
+    uint32_t dkey = 0;
+    for (int a = 0; a < nh; a++) {
+        int64_t g = gcd64(L, hs[a].T);
+        int64_t nl;
+        if (__builtin_mul_overflow(L, hs[a].T / g, &nl) || nl > lcm_cap) break;
+        L = nl;
+        dkey |= (uint32_t)1 << hs[a].h;
+        nd++;
+    }
+
+    env_entry *e = env_get(ec, dkey, J, C, T, lcm_cap);
+    if (e == NULL) return -1;
+    /* env_build may conservatively truncate a pathological key; align the
+     * sparse boundary with what the envelope actually covers. */
+    nd = (int)__builtin_popcount((unsigned)e->key);
+
+    int64_t dense_const = e->dense_const;
+    int64_t G = e->G;
+    int64_t win_min = e->win_min;
+    L = e->L;
+    int64_t S = e->S;
+    const int32_t *F = e->F;
+
+    if (G <= 0) {
+        /* Dense utilisation >= 1 (jitter does not change the asymptotic
+         * rate): the recurrence is strictly increasing -> certain miss. */
+        return 0;
+    }
 
     int rc_status = 0; /* 0 = miss */
     int64_t start = base;
@@ -372,7 +541,7 @@ static int least_fixed_point(int64_t base, int64_t Di,
         if (F[q0] - q0 <= rhs0) {
             q = q0; k = k0;
         } else {
-            FIRST_Q(q0, rhs0, q);
+            q = first_q(e, q0, rhs0);
             if (q <= L) {
                 k = k0;
             } else {
@@ -382,7 +551,7 @@ static int least_fixed_point(int64_t base, int64_t Di,
                 if (kc <= k0) kc = k0 + 1;
                 if (kc > kwin_max) break;
                 k = kc;
-                FIRST_Q(0, kc * G - rc - base - dense_const, q);
+                q = first_q(e, 0, kc * G - rc - base - dense_const);
                 if (q > L) break;
             }
         }
@@ -405,10 +574,6 @@ static int least_fixed_point(int64_t base, int64_t Di,
         start = z;
     }
 
-    #undef FIRST_Q
-    free(tree);
-    free(ev);
-    free(F);
     return rc_status;
 }
 
@@ -417,9 +582,11 @@ static int least_fixed_point(int64_t base, int64_t Di,
 /* Decision engine (DP inner loop): exact schedulability and, on success,
  * the exact least fixed point.  Misses return Di + 1 (the capped value the
  * objective uses). */
-int rta_light(int64_t Ji, int64_t Ci, int64_t Di, int64_t B,
-              const int64_t *J, const int64_t *C, const int64_t *T,
-              uint32_t hset, int *out_sched, int64_t *out_resp) {
+static int rta_light_cached(int64_t Ji, int64_t Ci, int64_t Di, int64_t B,
+                            const int64_t *J, const int64_t *C,
+                            const int64_t *T, uint32_t hset,
+                            env_cache *ec,
+                            int *out_sched, int64_t *out_resp) {
     int64_t base = Ji + Ci + B;
     if (base > Di) { *out_sched = 0; *out_resp = base; return 0; }
     if (cert_miss(base, Di, hset, J, C, T)) {
@@ -433,10 +600,22 @@ int rta_light(int64_t Ji, int64_t Ci, int64_t Di, int64_t B,
                     LONG_MAX / 2,
                     NULL, NULL, &n, 0, &sched, &resp);
     if (st == 2) st = least_fixed_point(base, Di, hset, J, C, T,
-                                        LCM_CAP, &resp);
+                                        LCM_CAP, ec, &resp);
     if (st == -1) return -1;
     *out_sched = st;
     *out_resp = st ? resp : Di + 1;
+    return st;
+}
+
+/* Public single-query entry: owns a one-shot envelope cache. */
+int rta_light(int64_t Ji, int64_t Ci, int64_t Di, int64_t B,
+              const int64_t *J, const int64_t *C, const int64_t *T,
+              uint32_t hset, int *out_sched, int64_t *out_resp) {
+    env_cache ec;
+    memset(&ec, 0, sizeof(ec));
+    int st = rta_light_cached(Ji, Ci, Di, B, J, C, T, hset, &ec,
+                              out_sched, out_resp);
+    env_cache_clear(&ec);
     return st;
 }
 
@@ -467,8 +646,11 @@ int rta_trace(int64_t Ji, int64_t Ci, int64_t Di, int64_t B,
 
     /* Budget exhausted: exact analytical decision. */
     int64_t z = 0;
+    env_cache ec;
+    memset(&ec, 0, sizeof(ec));
     int st2 = least_fixed_point(base, Di, mask, J, C, T,
-                                LCM_CAP_TRACE, &z);
+                                LCM_CAP_TRACE, &ec, &z);
+    env_cache_clear(&ec);
     if (st2 == -1) return -1;
     int64_t val = st2 ? z : Di + 1;
     if (cap > 0) {
@@ -528,6 +710,12 @@ int solve_dp(int n, const int64_t *J, const int64_t *C,
 
     int32_t sa[MAX_N], sb[MAX_N];
 
+    /* One cache for the whole DP: the dense envelope queried by a state
+     * depends only on the dense subset, which recurs across thousands of
+     * distinct sparse subsets. */
+    env_cache ec;
+    memset(&ec, 0, sizeof(ec));
+
     for (int mask = 1; mask < size; mask++) {
         int have_best = 0;
         int b_miss = 0;
@@ -543,8 +731,8 @@ int solve_dp(int n, const int64_t *J, const int64_t *C,
 
             int sched = 1;
             int64_t resp = 0;
-            int rc = rta_light(J[i], C[i], D[i], B, J, C, T,
-                               (uint32_t)prev, &sched, &resp);
+            int rc = rta_light_cached(J[i], C[i], D[i], B, J, C, T,
+                                      (uint32_t)prev, &ec, &sched, &resp);
             if (rc == -1) { status = -1; goto cleanup; }
 
             int c_miss = miss[prev] + (sched ? 0 : 1);
@@ -584,6 +772,7 @@ int solve_dp(int n, const int64_t *J, const int64_t *C,
     }
     status = 0;
 cleanup:
+    env_cache_clear(&ec);
     free(miss); free(score); free(parent); free(bmax);
     return status;
 }

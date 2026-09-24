@@ -88,6 +88,30 @@ def test_n18_runs_quickly():
     assert elapsed < 30.0
 
 
+def test_near_saturation_bus_decides_within_window():
+    # Two short-period messages plus twelve unit messages at T = 1e9 push the
+    # bus to the edge of schedulability.  The exact subset DP reuses the dense
+    # interference envelope across sparse tails; rebuilding it per state made
+    # this instance take ~55 s instead of returning inside the 30 s window.
+    msgs = [
+        {"id": 1, "C": 332, "T": 997, "D": 997, "J": 0},
+        {"id": 2, "C": 667, "T": 1000, "D": 1000, "J": 0},
+    ]
+    for kid in range(3, 15):
+        msgs.append({"id": kid, "C": 1, "T": 10**9, "D": 10**9, "J": 0})
+
+    start = time.time()
+    order, reports = scheduler.solve(msgs)
+    elapsed = time.time() - start
+
+    assert [msgs[i]["id"] for i in order] == [
+        3, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 1,
+    ]
+    assert sum(not r.schedulable for r in reports) == 1
+    assert sum(r.score_term for r in reports) == 21069
+    assert elapsed < 30.0
+
+
 def test_blocking_is_max_lower_priority_transmission():
     msgs = [
         {"id": 1, "C": 1, "T": 100, "D": 100, "J": 0},
