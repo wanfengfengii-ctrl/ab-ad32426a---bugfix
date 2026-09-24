@@ -1,0 +1,11 @@
+.venv/
+venv/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+node_modules/
+frontend/dist/
+backend/app/native/*.so
+backend/app/native/*.dylib
+.git/
+*.log

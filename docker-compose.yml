@@ -1,0 +1,51 @@
+# Satellite telemetry-bus analyser.
+#
+# Configurable via environment (with defaults):
+#   HOST_PORT             host port published for the web UI/API (8080)
+#   APP_PORT              port uvicorn listens on inside the container (8000)
+#   HEALTH_INTERVAL/      container health-check cadence and retries
+#   HEALTH_TIMEOUT/
+#   HEALTH_RETRIES/
+#   HEALTH_START_PERIOD
+#
+# Normal start:        docker compose up --build
+# One-shot verify:     docker compose --profile verify up --build verify
+#   (runs tests, build-artifact checks and API smoke, exits with code)
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: telemetry-bus:latest
+    ports:
+      - "${HOST_PORT:-8080}:${APP_PORT:-8000}"
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: ${APP_PORT:-8000}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          curl -fsS
+          "http://127.0.0.1:${APP_PORT:-8000}${HEALTH_PATH:-/api/health}"
+          || exit 1
+      interval: ${HEALTH_INTERVAL:-15s}
+      timeout: ${HEALTH_TIMEOUT:-5s}
+      retries: ${HEALTH_RETRIES:-5}
+      start_period: ${HEALTH_START_PERIOD:-10s}
+    restart: unless-stopped
+
+  verify:
+    profiles: ["verify"]
+    image: telemetry-bus:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      web:
+        condition: service_healthy
+    environment:
+      SMOKE_BASE_URL: http://web:${APP_PORT:-8000}
+    entrypoint: ["sh", "/app/scripts/verify.sh"]
+    restart: "no"
